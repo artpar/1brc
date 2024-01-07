@@ -1,3 +1,4 @@
+
 /*
  *  Copyright 2023 The original authors
  *
@@ -15,11 +16,20 @@
  */
 package dev.morling.onebrc;
 
+//import io.unlogged.Unlogged;
+
+import jdk.incubator.vector.ByteVector;
+import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorSpecies;
+
 import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.io.RandomAccessFile;
-import java.nio.MappedByteBuffer;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,11 +46,14 @@ import java.util.stream.Collectors;
 public class CalculateAverage_artpar {
     public static final int N_THREADS = 8;
     private static final String FILE = "./measurements.txt";
+    private static final int HASH_CONST = 0x9e3779b9; // a constant used in the hash computation
     // private static final VectorSpecies<Integer> SPECIES = IntVector.SPECIES_PREFERRED;
     // final int VECTOR_SIZE = 512;
     // final int VECTOR_SIZE_1 = VECTOR_SIZE - 1;
-    final int AVERAGE_CHUNK_SIZE = 1024 * 1024;
+    final int AVERAGE_CHUNK_SIZE = 1024 * 256;
     final int AVERAGE_CHUNK_SIZE_1 = AVERAGE_CHUNK_SIZE - 1;
+    // ExecutorService threadPool = Executors.newFixedThreadPool(N_THREADS);
+    // ExecutorService anotherThreadPool = Executors.newFixedThreadPool(N_THREADS);
 
     public CalculateAverage_artpar() throws IOException {
         long start = Instant.now().toEpochMilli();
@@ -48,9 +61,9 @@ public class CalculateAverage_artpar {
         long fileSize = Files.size(measurementFile);
 
         // System.out.println("File size - " + fileSize);
-        int expectedChunkSize = Math.toIntExact(Math.max(fileSize / N_THREADS, Integer.MAX_VALUE / 4));
+        int expectedChunkSize = Math.toIntExact(Math.min(fileSize / N_THREADS, Integer.MAX_VALUE));
 
-        ExecutorService threadPool = Executors.newFixedThreadPool(N_THREADS);
+        ExecutorService threadPool = Executors.newVirtualThreadPerTaskExecutor();
 
         long chunkStartPosition = 0;
         RandomAccessFile fis = new RandomAccessFile(measurementFile.toFile(), "r");
@@ -58,10 +71,14 @@ public class CalculateAverage_artpar {
         long bytesReadCurrent = 0;
 
         FileChannel fileChannel = FileChannel.open(measurementFile, StandardOpenOption.READ);
-        for (int i = 0; chunkStartPosition < fileSize; i++) {
+        while (chunkStartPosition < fileSize) {
 
-            int chunkSize = expectedChunkSize;
-            chunkSize = fis.skipBytes(chunkSize);
+            // if (bytesReadCurrent % (1024 * 1024) == 0) {
+            // System.out.println("Read " + bytesReadCurrent);
+            // }
+
+            long chunkSize = expectedChunkSize;
+            chunkSize = fis.skipBytes(Math.toIntExact(chunkSize));
 
             bytesReadCurrent += chunkSize;
             while (((char) fis.read()) != '\n' && bytesReadCurrent < fileSize) {
@@ -71,23 +88,24 @@ public class CalculateAverage_artpar {
 
             // System.out.println("[" + chunkStartPosition + "] - [" + (chunkStartPosition + chunkSize) + " bytes");
             if (chunkStartPosition + chunkSize >= fileSize) {
-                chunkSize = (int) Math.min(fileSize - chunkStartPosition, Integer.MAX_VALUE);
+                chunkSize = (int) Math.min(fileSize - chunkStartPosition, chunkSize);
             }
             if (chunkSize < 1) {
                 break;
             }
-            if (chunkSize >= Integer.MAX_VALUE) {
-                chunkSize = Integer.MAX_VALUE / 8;
+            if (chunkSize > Integer.MAX_VALUE) {
+                chunkSize = Integer.MAX_VALUE;
             }
 
             // MappedByteBuffer mappedByteBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, chunkStartPosition,
             // chunkSize);
 
-            ReaderRunnable readerRunnable = new ReaderRunnable(chunkStartPosition, chunkSize, fileChannel);
+            ReaderRunnable readerRunnable = new ReaderRunnable(chunkStartPosition, Math.toIntExact(chunkSize),
+                    fileChannel);
             Future<Map<String, MeasurementAggregator>> future = threadPool.submit(readerRunnable::run);
             // System.out.println("Added future [" + chunkStartPosition + "][" + chunkSize + "]");
             futures.add(future);
-            chunkStartPosition = chunkStartPosition + chunkSize + 1;
+            chunkStartPosition += chunkSize + 1;
         }
 
         fis.close();
@@ -100,7 +118,7 @@ public class CalculateAverage_artpar {
                     catch (InterruptedException | ExecutionException e) {
                         throw new RuntimeException(e);
                     }
-                }).parallel().collect(Collectors.toMap(
+                }).collect(Collectors.toMap(
                         Map.Entry::getKey, Map.Entry::getValue,
                         MeasurementAggregator::combine));
         fileChannel.close();
@@ -138,33 +156,9 @@ public class CalculateAverage_artpar {
 
     }
 
+    // @Unlogged
     public static void main(String[] args) throws IOException {
         new CalculateAverage_artpar();
-    }
-
-    public static int hashCode(byte[] array, int length) {
-
-        int h = 1;
-        int i = 0;
-        for (; i + 7 < length; i += 8) {
-            h = 31 * 31 * 31 * 31 * 31 * 31 * 31 * 31 * h + 31 * 31 * 31 * 31
-                    * 31 * 31 * 31 * array[i] + 31 * 31 * 31 * 31 * 31 * 31
-                            * array[i + 1]
-                    + 31 * 31 * 31 * 31 * 31 * array[i + 2] + 31
-                            * 31 * 31 * 31 * array[i + 3]
-                    + 31 * 31 * 31 * array[i + 4]
-                    + 31 * 31 * array[i + 5] + 31 * array[i + 6] + array[i + 7];
-        }
-
-        for (; i + 3 < length; i += 4) {
-            h = 31 * 31 * 31 * 31 * h + 31 * 31 * 31 * array[i] + 31 * 31
-                    * array[i + 1] + 31 * array[i + 2] + array[i + 3];
-        }
-        for (; i < length; i++) {
-            h = 31 * h + array[i];
-        }
-
-        return h;
     }
 
     private record ResultRow(double min, double mean, double max) {
@@ -181,21 +175,31 @@ public class CalculateAverage_artpar {
         }
     }
 
+    static class StationName {
+        public final int hash;
+        private final byte[] nameBytes;
+        public MeasurementAggregator measurementAggregator;
+
+        public StationName(byte[] nameBytes, int hash, int doubleValue) {
+            this.nameBytes = nameBytes;
+            this.hash = hash;
+            measurementAggregator = new MeasurementAggregator(doubleValue, doubleValue, doubleValue, 1);
+        }
+
+    }
+
     private static class MeasurementAggregator {
-        private double min = Double.POSITIVE_INFINITY;
-        private double max = Double.NEGATIVE_INFINITY;
+        private int min;
+        private int max;
         private double sum;
         private long count;
 
-        public MeasurementAggregator() {
+        public MeasurementAggregator(int min, int max, double sum, long count) {
+            this.min = min;
+            this.max = max;
+            this.sum = sum;
+            this.count = count;
         }
-
-        // public MeasurementAggregator(double min, double max, double sum, long count) {
-        // this.min = min;
-        // this.max = max;
-        // this.sum = sum;
-        // this.count = count;
-        // }
 
         MeasurementAggregator combine(MeasurementAggregator other) {
             min = Math.min(min, other.min);
@@ -205,20 +209,11 @@ public class CalculateAverage_artpar {
             return this;
         }
 
-        // MeasurementAggregator combine(double otherMin, double otherMax, double otherSum, long otherCount) {
-        // min = Math.min(min, otherMin);
-        // max = Math.max(max, otherMax);
-        // sum += otherSum;
-        // count += otherCount;
-        // return this;
-        // }
-
-        MeasurementAggregator combine(double value) {
-            min = Math.min(min, value);
-            max = Math.max(max, value);
+        void combine(int value) {
+            min = min < value ? min : value;
+            max = max > value ? max : value;
             sum += value;
             count += 1;
-            return this;
         }
 
         ResultRow finish() {
@@ -227,23 +222,8 @@ public class CalculateAverage_artpar {
         }
     }
 
-    static class StationName {
-        public final int hash;
-        private final byte[] nameBytes;
-        // private final int index;
-        public int count = 0;
-        // public int[] values = new int[VECTOR_SIZE];
-        public MeasurementAggregator measurementAggregator = new MeasurementAggregator();
-
-        public StationName(byte[] nameBytes, int hash) {
-            this.nameBytes = nameBytes;
-            // this.index = index;
-            this.hash = hash;
-        }
-
-    }
-
     private class ReaderRunnable {
+        private static final VectorSpecies<Byte> BYTE_SPECIES = ByteVector.SPECIES_MAX;
         private final long startPosition;
         private final int chunkSize;
         private final FileChannel fileChannel;
@@ -256,59 +236,143 @@ public class CalculateAverage_artpar {
         }
 
         public Map<String, MeasurementAggregator> run() throws IOException {
-            MappedByteBuffer mappedByteBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, startPosition,
-                    chunkSize);
+            // System.out.println("Started " + startPosition);
+            MemorySegment memorySegment = fileChannel.map(FileChannel.MapMode.READ_ONLY,
+                    startPosition, chunkSize, Arena.ofConfined());
 
-            byte[] rawBuffer = new byte[200];
-            int rawBufferReadIndex = 0;
-            boolean negative;
-            int result;
+            // MappedByteBuffer mappedByteBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, startPosition,
+            // chunkSize);
+
+            // System.out.println("start reading " + startPosition);
+            long start = System.currentTimeMillis();
             int position = 0;
+            int hash = 0;
+            int gotHash = 0;
+
             byte b;
-            int hash;
-            while (position < chunkSize) {
-                hash = 0;
-                while ((rawBuffer[rawBufferReadIndex++] = mappedByteBuffer.get(position++)) != ';') {
-                    hash = hash * 31 + rawBuffer[rawBufferReadIndex - 1];
+            int result;
+            // int gotResult;
+            int isNegative;
+            byte one, two, three, four;
+            int rawBufferReadIndex = 0;
+
+            int lineStartIndex = 0;
+            int semicolonOffset = 0;
+            int newLineOffset = 0;
+            int valueStartOffset = 0;
+
+            // ByteVector line = ByteVector.fromMemorySegment(BYTE_SPECIES, memorySegment, 0,
+            // ByteOrder.nativeOrder());
+
+            try {
+
+                int value = 0;
+
+                int sizeToProcessByVector = BYTE_SPECIES.loopBound(chunkSize) - 32;
+                while (position < sizeToProcessByVector) {
+                    lineStartIndex = position;
+                    newLineOffset = 0;
+                    ByteVector line = ByteVector.fromMemorySegment(BYTE_SPECIES, memorySegment, position,
+                            ByteOrder.nativeOrder());
+                    position += line.length();
+                    ByteVector line2 = ByteVector.fromMemorySegment(BYTE_SPECIES, memorySegment, position,
+                            ByteOrder.nativeOrder());
+                    position += line.length();
+                    int offset;
+                    semicolonOffset = offset = line.compare(VectorOperators.EQ, ';').firstTrue();
+                    while (offset == line.length()) {
+                        line = line2;
+                        line2 = ByteVector.fromMemorySegment(BYTE_SPECIES, memorySegment, position,
+                                ByteOrder.nativeOrder());
+                        position += line.length();
+                        newLineOffset += line.length();
+                        offset = line.compare(VectorOperators.EQ, ';').firstTrue();
+                        semicolonOffset += offset;
+                    }
+                    semicolonOffset += lineStartIndex;
+                    newLineOffset += (offset = line.compare(VectorOperators.EQ, '\n').firstTrue());
+                    while (offset == line.length()) {
+                        line = line2;
+                        line2 = ByteVector.fromMemorySegment(BYTE_SPECIES, memorySegment, position,
+                                ByteOrder.nativeOrder());
+                        position += line2.length();
+                        offset = line.compare(VectorOperators.EQ, '\n').firstTrue();
+                        newLineOffset += offset;
+                    }
+                    newLineOffset = lineStartIndex + newLineOffset;
+                    // MappedByteBuffer row = mappedByteBuffer.slice(lineStartIndex,
+                    // newLineOffset - lineStartIndex);
+
+                    // while ((b = memorySegment.get(ValueLayout.JAVA_BYTE, position++)) != ';') {
+                    // hash ^= (b & 0xff); // XOR the byte with the hash
+                    // hash = (hash << 5) | (hash >>> -5); // Rotate left to mix the bits
+                    // hash ^= HASH_CONST; // XOR with the constant to further mix
+                    // }
+
+                    // semicolonOffset = position - 1;
+                    valueStartOffset = semicolonOffset + 1;
+                    isNegative = memorySegment.get(ValueLayout.JAVA_BYTE,
+                            valueStartOffset) == '-' && valueStartOffset++ > 0 ? -1 : 1;
+                    // while (memorySegment.get(ValueLayout.JAVA_BYTE, position++) != '\n' && position < chunkSize) {
+                    // }
+                    // newLineOffset = position - 1;
+
+                    int nameLength = semicolonOffset - lineStartIndex;
+                    MemorySegment nameSlice = memorySegment.asSlice(lineStartIndex, nameLength);
+                    hash = Arrays.hashCode(nameSlice.toArray(ValueLayout.JAVA_BYTE));
+                    long valueLength = newLineOffset - 1 - valueStartOffset;
+                    MemorySegment valueSlice = memorySegment.asSlice(valueStartOffset, valueLength + 1);
+
+                    if (valueSlice.get(ValueLayout.JAVA_BYTE, 1) == '.') {
+                        value = isNegative * (valueSlice.get(ValueLayout.JAVA_BYTE, 0) * 10 +
+                                valueSlice.get(ValueLayout.JAVA_BYTE, 2) - 528);
+                    }
+                    else {
+                        value = isNegative * (valueSlice.get(ValueLayout.JAVA_BYTE, 0) * 100 +
+                                valueSlice.get(ValueLayout.JAVA_BYTE, 1) * 10 +
+                                valueSlice.get(ValueLayout.JAVA_BYTE, 3) - 5328);
+                    }
+
+                    stationNameMap.getOrCreate(nameSlice, nameLength, value, hash);
+                    position = newLineOffset + 1;
+
                 }
 
-                negative = false;
-                result = 0;
+                byte[] rawBuffer = new byte[200];
+                while (position < chunkSize) {
 
-                b = mappedByteBuffer.get(position++);
-                if (b == '-') {
-                    byte one = mappedByteBuffer.get(position);
-                    byte two = mappedByteBuffer.get(position + 1);
-                    byte three = mappedByteBuffer.get(position + 2);
-                    if (two == '.') {
-                        result = -1 * (((one - '0') * 10 + (three - '0')));
-                        position = position + 4;
+                    b = memorySegment.get(ValueLayout.JAVA_BYTE, position++);
+                    rawBuffer[rawBufferReadIndex++] = b;
+                    hash ^= (b & 0xff); // XOR the byte with the hash
+                    hash = (hash << 5) | (hash >>> -5); // Rotate left to mix the bits
+                    hash ^= HASH_CONST; // XOR with the constant to further mix
+
+                    if (b != ';') {
+                        continue;
                     }
-                    else if (three == '.') {
-                        result = -1 * ((((one - '0') * 10 * 10) + ((two - '0') * 10) + mappedByteBuffer.get(
-                                position + 3)) - '0');
-                        position = position + 5;
-                    }
+                    result = memorySegment.get(ValueLayout.JAVA_BYTE, position++) * 10;
+                    isNegative = result == 450 && ((result = memorySegment.get(ValueLayout.JAVA_BYTE,
+                            position++) * 10) == 0 || true) ? -1 : 1;
+                    result = isNegative * ((one = memorySegment.get(ValueLayout.JAVA_BYTE,
+                            position++)) == '.' ? result + memorySegment.get(ValueLayout.JAVA_BYTE, position++) - 528
+                                    : result * 10 + one * 10 + (position++ * 0) +
+                                            memorySegment.get(ValueLayout.JAVA_BYTE, position++) - 5328);
+                    position++;
+                    stationNameMap.getOrCreate(rawBuffer, rawBufferReadIndex - 1, result, hash);
+                    hash = 0;
+                    rawBufferReadIndex = 0;
                 }
-                else {
-                    byte two = mappedByteBuffer.get(position);
-                    byte three = mappedByteBuffer.get(position + 1);
-                    if (two == '.') {
-                        result = (b - '0') * 10 + (three - '0');
-                        position = position + 3;
-                    }
-                    else if (three == '.') {
-                        result = ((b - '0') * 10 * 10) + ((two - '0') * 10) + mappedByteBuffer.get(position + 2) - '0';
-                        position = position + 4;
-                    }
-
-                }
-
-                stationNameMap.getOrCreate(rawBuffer, rawBufferReadIndex - 1, negative ? -result : result, hash);
-                rawBufferReadIndex = 0;
             }
+            catch (Exception e) {
+                e.printStackTrace();
+                //
+            }
+            long end = System.currentTimeMillis();
+            System.out.println("completed reading " + position + " - " + (end - start) / 1000);
             return Arrays.stream(stationNameMap.names).parallel().filter(Objects::nonNull)
-                    .collect(Collectors.toMap(e -> new String(e.nameBytes), e -> e.measurementAggregator));
+                    .collect(Collectors.toMap(e -> new String(e.nameBytes), e -> e.measurementAggregator,
+                            MeasurementAggregator::combine));
+
         }
     }
 
@@ -322,21 +386,36 @@ public class CalculateAverage_artpar {
             while (indexes[position] != 0 && names[indexes[position]].hash != hash) {
                 position = ++position & AVERAGE_CHUNK_SIZE_1;
             }
+            StationName stationName;
             if (indexes[position] != 0) {
-                StationName stationName = names[indexes[position]];
-                stationName.measurementAggregator.combine(doubleValue);
-                stationName.count++;
+                names[indexes[position]].measurementAggregator.combine(doubleValue);
             }
             else {
                 byte[] destination = new byte[length];
                 System.arraycopy(stationNameBytes, 0, destination, 0, length);
-                StationName stationName = new StationName(destination, hash);
+                stationName = new StationName(destination, hash, doubleValue);
                 indexes[position] = ++currentIndex;
                 names[indexes[position]] = stationName;
-
-                stationName.measurementAggregator.combine(doubleValue);
-                stationName.count++;
             }
+        }
+
+        public void getOrCreate(MemorySegment nameSlice, int length, int doubleValue, int hash) {
+            int position = hash & AVERAGE_CHUNK_SIZE_1;
+            while (indexes[position] != 0 && names[indexes[position]].hash != hash) {
+                position = ++position & AVERAGE_CHUNK_SIZE_1;
+            }
+            StationName stationName;
+            if (indexes[position] != 0) {
+                names[indexes[position]].measurementAggregator.combine(doubleValue);
+            }
+            else {
+                byte[] destination = new byte[length];
+                System.arraycopy(nameSlice.toArray(ValueLayout.JAVA_BYTE), 0, destination, 0, length);
+                stationName = new StationName(destination, hash, doubleValue);
+                indexes[position] = ++currentIndex;
+                names[indexes[position]] = stationName;
+            }
+
         }
     }
 
