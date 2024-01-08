@@ -61,9 +61,9 @@ public class CalculateAverage_artpar {
         long fileSize = Files.size(measurementFile);
 
         // System.out.println("File size - " + fileSize);
-        int expectedChunkSize = Math.toIntExact(Math.min(fileSize / N_THREADS, Integer.MAX_VALUE));
+        int expectedChunkSize = Math.toIntExact(Math.min(fileSize / N_THREADS, Integer.MAX_VALUE / 2));
 
-        ExecutorService threadPool = Executors.newVirtualThreadPerTaskExecutor();
+        ExecutorService threadPool = Executors.newFixedThreadPool(N_THREADS);
 
         long chunkStartPosition = 0;
         RandomAccessFile fis = new RandomAccessFile(measurementFile.toFile(), "r");
@@ -86,7 +86,7 @@ public class CalculateAverage_artpar {
                 bytesReadCurrent++;
             }
 
-            // System.out.println("[" + chunkStartPosition + "] - [" + (chunkStartPosition + chunkSize) + " bytes");
+            System.out.println("[" + chunkStartPosition + "] - [" + (chunkStartPosition + chunkSize) + " bytes");
             if (chunkStartPosition + chunkSize >= fileSize) {
                 chunkSize = (int) Math.min(fileSize - chunkStartPosition, chunkSize);
             }
@@ -103,7 +103,7 @@ public class CalculateAverage_artpar {
             ReaderRunnable readerRunnable = new ReaderRunnable(chunkStartPosition, Math.toIntExact(chunkSize),
                     fileChannel);
             Future<Map<String, MeasurementAggregator>> future = threadPool.submit(readerRunnable::run);
-            // System.out.println("Added future [" + chunkStartPosition + "][" + chunkSize + "]");
+            System.out.println("Added future [" + chunkStartPosition + "][" + chunkSize + "]");
             futures.add(future);
             chunkStartPosition += chunkSize + 1;
         }
@@ -244,101 +244,91 @@ public class CalculateAverage_artpar {
             // chunkSize);
 
             // System.out.println("start reading " + startPosition);
-            long start = System.currentTimeMillis();
             int position = 0;
             int hash = 0;
-            int gotHash = 0;
-
-            byte b;
-            int result;
-            // int gotResult;
             int isNegative;
-            byte one, two, three, four;
-            int rawBufferReadIndex = 0;
 
             int lineStartIndex = 0;
             int semicolonOffset = 0;
             int newLineOffset = 0;
             int valueStartOffset = 0;
 
-            // ByteVector line = ByteVector.fromMemorySegment(BYTE_SPECIES, memorySegment, 0,
-            // ByteOrder.nativeOrder());
-
             try {
 
                 int value = 0;
 
                 int sizeToProcessByVector = BYTE_SPECIES.loopBound(chunkSize) - 32;
-                while (position < sizeToProcessByVector) {
-                    lineStartIndex = position;
-                    newLineOffset = 0;
-                    ByteVector line = ByteVector.fromMemorySegment(BYTE_SPECIES, memorySegment, position,
-                            ByteOrder.nativeOrder());
-                    position += line.length();
-                    ByteVector line2 = ByteVector.fromMemorySegment(BYTE_SPECIES, memorySegment, position,
-                            ByteOrder.nativeOrder());
-                    position += line.length();
-                    int offset;
-                    semicolonOffset = offset = line.compare(VectorOperators.EQ, ';').firstTrue();
-                    while (offset == line.length()) {
-                        line = line2;
-                        line2 = ByteVector.fromMemorySegment(BYTE_SPECIES, memorySegment, position,
+                if (sizeToProcessByVector > 0) {
+                    ByteVector line;
+                    while (position < sizeToProcessByVector) {
+                        newLineOffset = 0;
+                        int offset;
+                        line = ByteVector.fromMemorySegment(BYTE_SPECIES, memorySegment, lineStartIndex,
                                 ByteOrder.nativeOrder());
-                        position += line.length();
-                        newLineOffset += line.length();
-                        offset = line.compare(VectorOperators.EQ, ';').firstTrue();
-                        semicolonOffset += offset;
+
+                        semicolonOffset = offset = line.compare(VectorOperators.EQ, ';').firstTrue();
+                        while (offset == line.length()) {
+                            position += line.length();
+                            line = ByteVector.fromMemorySegment(BYTE_SPECIES, memorySegment, position,
+                                    ByteOrder.nativeOrder());
+                            newLineOffset += line.length();
+                            offset = line.compare(VectorOperators.EQ, ';').firstTrue();
+                            semicolonOffset += offset;
+                        }
+                        semicolonOffset += lineStartIndex;
+                        newLineOffset += (offset = line.compare(VectorOperators.EQ, '\n').firstTrue());
+                        while (offset == line.length()) {
+                            position += line.length();
+                            line = ByteVector.fromMemorySegment(BYTE_SPECIES, memorySegment, position,
+                                    ByteOrder.nativeOrder());
+                            offset = line.compare(VectorOperators.EQ, '\n').firstTrue();
+                            newLineOffset += offset;
+                        }
+                        newLineOffset = lineStartIndex + newLineOffset;
+                        // MappedByteBuffer row = mappedByteBuffer.slice(lineStartIndex,
+                        // newLineOffset - lineStartIndex);
+
+                        // while ((b = memorySegment.get(ValueLayout.JAVA_BYTE, position++)) != ';') {
+                        // hash ^= (b & 0xff); // XOR the byte with the hash
+                        // hash = (hash << 5) | (hash >>> -5); // Rotate left to mix the bits
+                        // hash ^= HASH_CONST; // XOR with the constant to further mix
+                        // }
+
+                        // semicolonOffset = position - 1;
+                        valueStartOffset = semicolonOffset + 1;
+                        isNegative = memorySegment.get(ValueLayout.JAVA_BYTE,
+                                valueStartOffset) == '-' && valueStartOffset++ > 0 ? -1 : 1;
+                        // while (memorySegment.get(ValueLayout.JAVA_BYTE, position++) != '\n' && position < chunkSize) {
+                        // }
+                        // newLineOffset = position - 1;
+
+                        int nameLength = semicolonOffset - lineStartIndex;
+                        MemorySegment nameSlice = memorySegment.asSlice(lineStartIndex, nameLength);
+                        hash = Arrays.hashCode(nameSlice.toArray(ValueLayout.JAVA_BYTE));
+                        long valueLength = newLineOffset - 1 - valueStartOffset;
+                        MemorySegment valueSlice = memorySegment.asSlice(valueStartOffset, valueLength + 1);
+
+                        if (valueSlice.get(ValueLayout.JAVA_BYTE, 1) == '.') {
+                            value = isNegative * (valueSlice.get(ValueLayout.JAVA_BYTE, 0) * 10 +
+                                    valueSlice.get(ValueLayout.JAVA_BYTE, 2) - 528);
+                        }
+                        else {
+                            value = isNegative * (valueSlice.get(ValueLayout.JAVA_BYTE, 0) * 100 +
+                                    valueSlice.get(ValueLayout.JAVA_BYTE, 1) * 10 +
+                                    valueSlice.get(ValueLayout.JAVA_BYTE, 3) - 5328);
+                        }
+
+                        stationNameMap.getOrCreate(nameSlice, nameLength, value, hash);
+                        position = newLineOffset + 1;
+                        lineStartIndex = position;
                     }
-                    semicolonOffset += lineStartIndex;
-                    newLineOffset += (offset = line.compare(VectorOperators.EQ, '\n').firstTrue());
-                    while (offset == line.length()) {
-                        line = line2;
-                        line2 = ByteVector.fromMemorySegment(BYTE_SPECIES, memorySegment, position,
-                                ByteOrder.nativeOrder());
-                        position += line2.length();
-                        offset = line.compare(VectorOperators.EQ, '\n').firstTrue();
-                        newLineOffset += offset;
-                    }
-                    newLineOffset = lineStartIndex + newLineOffset;
-                    // MappedByteBuffer row = mappedByteBuffer.slice(lineStartIndex,
-                    // newLineOffset - lineStartIndex);
-
-                    // while ((b = memorySegment.get(ValueLayout.JAVA_BYTE, position++)) != ';') {
-                    // hash ^= (b & 0xff); // XOR the byte with the hash
-                    // hash = (hash << 5) | (hash >>> -5); // Rotate left to mix the bits
-                    // hash ^= HASH_CONST; // XOR with the constant to further mix
-                    // }
-
-                    // semicolonOffset = position - 1;
-                    valueStartOffset = semicolonOffset + 1;
-                    isNegative = memorySegment.get(ValueLayout.JAVA_BYTE,
-                            valueStartOffset) == '-' && valueStartOffset++ > 0 ? -1 : 1;
-                    // while (memorySegment.get(ValueLayout.JAVA_BYTE, position++) != '\n' && position < chunkSize) {
-                    // }
-                    // newLineOffset = position - 1;
-
-                    int nameLength = semicolonOffset - lineStartIndex;
-                    MemorySegment nameSlice = memorySegment.asSlice(lineStartIndex, nameLength);
-                    hash = Arrays.hashCode(nameSlice.toArray(ValueLayout.JAVA_BYTE));
-                    long valueLength = newLineOffset - 1 - valueStartOffset;
-                    MemorySegment valueSlice = memorySegment.asSlice(valueStartOffset, valueLength + 1);
-
-                    if (valueSlice.get(ValueLayout.JAVA_BYTE, 1) == '.') {
-                        value = isNegative * (valueSlice.get(ValueLayout.JAVA_BYTE, 0) * 10 +
-                                valueSlice.get(ValueLayout.JAVA_BYTE, 2) - 528);
-                    }
-                    else {
-                        value = isNegative * (valueSlice.get(ValueLayout.JAVA_BYTE, 0) * 100 +
-                                valueSlice.get(ValueLayout.JAVA_BYTE, 1) * 10 +
-                                valueSlice.get(ValueLayout.JAVA_BYTE, 3) - 5328);
-                    }
-
-                    stationNameMap.getOrCreate(nameSlice, nameLength, value, hash);
-                    position = newLineOffset + 1;
 
                 }
 
                 byte[] rawBuffer = new byte[200];
+                byte b;
+                byte one;
+                int rawBufferReadIndex = 0;
                 while (position < chunkSize) {
 
                     b = memorySegment.get(ValueLayout.JAVA_BYTE, position++);
@@ -350,7 +340,7 @@ public class CalculateAverage_artpar {
                     if (b != ';') {
                         continue;
                     }
-                    result = memorySegment.get(ValueLayout.JAVA_BYTE, position++) * 10;
+                    int result = memorySegment.get(ValueLayout.JAVA_BYTE, position++) * 10;
                     isNegative = result == 450 && ((result = memorySegment.get(ValueLayout.JAVA_BYTE,
                             position++) * 10) == 0 || true) ? -1 : 1;
                     result = isNegative * ((one = memorySegment.get(ValueLayout.JAVA_BYTE,
@@ -368,7 +358,7 @@ public class CalculateAverage_artpar {
                 //
             }
             long end = System.currentTimeMillis();
-            System.out.println("completed reading " + position + " - " + (end - start) / 1000);
+            // System.out.println("completed reading " + position + " - " + (end - start) / 1000);
             return Arrays.stream(stationNameMap.names).parallel().filter(Objects::nonNull)
                     .collect(Collectors.toMap(e -> new String(e.nameBytes), e -> e.measurementAggregator,
                             MeasurementAggregator::combine));
